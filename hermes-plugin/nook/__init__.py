@@ -14,7 +14,14 @@ INBOX = Path.home() / "Library" / "Application Support" / "Nook" / "inbox"
 
 
 def _path(session_id):
-    return INBOX / f"hermes-{re.sub(r'[^A-Za-z0-9_.-]', '_', session_id)}.json"
+    name = f"{_profile() or 'default'}-{session_id}"
+    return INBOX / f"hermes-{re.sub(r'[^A-Za-z0-9_.-]', '_', name)}.json"
+
+
+def _profile():
+    """The profile this Hermes runs as (HERMES_HOME=~/.hermes/profiles/<name>), or None for the default."""
+    home = Path(os.environ.get("HERMES_HOME") or "")
+    return home.name if home.parent.name == "profiles" else None
 
 
 def _session_id(kwargs):
@@ -23,15 +30,18 @@ def _session_id(kwargs):
 
 def _write(session_id, detail):
     try:
-        INBOX.mkdir(parents=True, exist_ok=True)
+        # Owner-only: the detail can quote the command waiting for approval.
+        INBOX.mkdir(mode=0o700, parents=True, exist_ok=True)
         target = _path(session_id)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "app": "Hermes", "bundleId": "com.nousresearch.hermes", "threadId": session_id,
+        tmp = INBOX / f".{target.name}.{os.getpid()}.tmp"
+        record = json.dumps({
+            "app": "Hermes", "bundleId": "com.nousresearch.hermes", "threadId": session_id, "profile": _profile(),
             "state": "needs_input", "detail": detail[:80], "updatedAt": time.time(),
             # Safety net in case the matching "answered" hook never fires.
             "expiresAt": time.time() + 3600,
-        }))
+        })
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as file:
+            file.write(record)
         os.replace(tmp, target)
     except Exception:
         pass  # observability must never break the agent

@@ -3,7 +3,7 @@
 // Since macOS 15.4 MediaRemote only answers Apple-signed processes, and perl is one. Nook runs
 // `perl stream.pl NookMedia.dylib`; this library then:
 //   - prints one JSON line on stdout every time Now Playing changes (event-driven, no polling)
-//   - reads commands on stdin: toggle | play | pause | next | prev | seek <seconds>
+//   - reads commands on stdin: toggle | next | prev | seek <seconds>
 // It exits when stdin closes, so it never outlives Nook.
 
 #import <Foundation/Foundation.h>
@@ -27,13 +27,34 @@ static MRClientString clientBundle, clientParent;
 static NSUInteger lastArtHash;
 static NSUInteger lastArtLength;
 static BOOL pending;
+static NSData *lastLine;
+static dispatch_source_t verifier;
 
 static void emit(NSDictionary *payload) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-    if (!data) return;
+    if (!data || [data isEqualToData:lastLine]) return; // nothing changed: don't wake Nook
+    lastLine = data;
     fwrite(data.bytes, 1, data.length, stdout);
     fputc('\n', stdout);
     fflush(stdout);
+}
+
+static void publish(void);
+
+// A player that goes away (closed tab, quit browser) often sends its last notification late or
+// never, which would leave Nook showing "playing" forever. So only while something plays, re-read
+// every few seconds; once it stops, it's purely event-driven again.
+static void setVerifying(BOOL on) {
+    if (on == (verifier != nil)) return;
+    if (on) {
+        verifier = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(verifier, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, NSEC_PER_SEC);
+        dispatch_source_set_event_handler(verifier, ^{ publish(); });
+        dispatch_resume(verifier);
+    } else {
+        dispatch_source_cancel(verifier);
+        verifier = nil;
+    }
 }
 
 static void publish(void) {
@@ -44,6 +65,7 @@ static void publish(void) {
             getClient(dispatch_get_main_queue(), ^(id client) {
                 NSMutableDictionary *out = [NSMutableDictionary dictionary];
                 out[@"playing"] = playing ? @YES : @NO;
+                setVerifying(playing && info.count > 0);
                 NSString *bundle = client ? (__bridge NSString *)clientBundle(client) : nil;
                 NSString *parent = client && clientParent ? (__bridge NSString *)clientParent(client) : nil;
                 if (parent.length) out[@"bundle"] = parent;
@@ -85,24 +107,30 @@ static void publish(void) {
     });
 }
 
-// MediaRemote fires bursts of notifications per change; coalesce them into one read.
+// MediaRemote fires bursts of notifications per change; coalesce them into one read, plus a
+// follow-up once the player has settled (the first read can still see the old state).
 static void schedulePublish(void) {
     if (pending) return;
     pending = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ publish(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 800 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ if (!pending) publish(); });
 }
 
 static void handleCommand(NSString *line) {
     NSArray<NSString *> *parts = [line componentsSeparatedByString:@" "];
     NSString *verb = parts.firstObject;
-    // MRMediaRemoteCommand values: play 0, pause 1, toggle 2, next 4, previous 5.
+    // MRMediaRemoteCommand values: toggle 2, next 4, previous 5.
     if ([verb isEqualToString:@"toggle"]) sendCommand(2, NULL);
-    else if ([verb isEqualToString:@"play"]) sendCommand(0, NULL);
-    else if ([verb isEqualToString:@"pause"]) sendCommand(1, NULL);
     else if ([verb isEqualToString:@"next"]) sendCommand(4, NULL);
     else if ([verb isEqualToString:@"prev"]) sendCommand(5, NULL);
     else if ([verb isEqualToString:@"seek"] && parts.count > 1) setElapsed(parts[1].doubleValue);
-    else if ([verb isEqualToString:@"refresh"]) schedulePublish();
+    else return;
+    // Nook already shows the command's result. Once the player has settled, report its real state
+    // even if nothing changed, so a command the player ignored doesn't leave Nook showing it.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 900 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        lastLine = nil;
+        publish();
+    });
 }
 
 __attribute__((visibility("default"))) void nook_run(void) {
@@ -126,7 +154,7 @@ __attribute__((visibility("default"))) void nook_run(void) {
         @"kMRMediaRemoteNowPlayingApplicationClientStateDidChange",
     ]) {
         [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:nil
-                                                    usingBlock:^(NSNotification *note) { schedulePublish(); }];
+                                                    usingBlock:^(NSNotification *_) { schedulePublish(); }];
     }
 
     // Commands from Nook, one per line. EOF means Nook quit.

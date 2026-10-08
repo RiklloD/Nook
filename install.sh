@@ -1,6 +1,8 @@
 #!/bin/zsh
 # Builds Nook and installs it to /Applications, so Spotlight, Tinycast and Finder can launch it.
-# Opening Nook again while it runs opens the notch panel. Pass --hermes to also copy the Hermes plugin.
+# Opening Nook again while it runs opens the notch panel. Pass --hermes to also copy the Hermes plugin,
+# --claude to add Nook's hooks to ~/.claude/settings.json (needed to see Claude Code sessions; they
+# run this installed Nook.app, so re-run with --claude if it moves).
 set -euo pipefail
 cd "${0:A:h}"
 ./build.sh
@@ -14,7 +16,10 @@ cp -R build.noindex/Nook.app $dest/
 # Index it right away instead of waiting for Spotlight/LaunchServices to notice.
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f $dest/Nook.app
 mdimport $dest/Nook.app 2>/dev/null || true
-if [[ "${1:-}" == "--hermes" ]]; then
+if [[ " $* " == *" --claude "* ]]; then
+  osascript -l JavaScript tools/claude-hooks.js add "${dest:A}/Nook.app"
+fi
+if [[ " $* " == *" --hermes "* ]]; then
   mkdir -p ~/.hermes/plugins
   rm -rf ~/.hermes/plugins/nook
   cp -R hermes-plugin/nook ~/.hermes/plugins/

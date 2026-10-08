@@ -18,37 +18,32 @@ private struct NotchBody: View {
 
     var body: some View {
         let size = model.size
-        let shape = NotchShape(ear: model.earRadius, bottom: model.bottomRadius)
-        // Each layer is laid out at the size it's heading to and the morphing shape uncovers it,
-        // so nothing inside re-flows (and jitters) on every frame of the spring.
+        // The black silhouette and its clipping are Core Animation layers (NotchSilhouette) that
+        // spring on the render server's clock. Content here never moves with the shape: every layer
+        // sits where it will end up, centered under the camera, and the silhouette uncovers it.
         ZStack(alignment: .top) {
             if model.phase == .open {
                 OpenLayer(media: media, agents: agents, pager: model.pager)
                     .transition(.notchContent)
             } else {
                 closedLayer
-                    .frame(width: size.width, height: size.height, alignment: .top)
                     .transition(.notchContent)
             }
         }
+        // Only the hit area follows the shape; centered content stays put whatever its size.
         .frame(width: size.width + model.earRadius * 2, height: size.height, alignment: .top)
-        .clipShape(shape)
-        // The shadow is cast by the plain black shape, not the whole view tree, which would have
-        // to be re-rendered offscreen every frame.
-        .background {
-            shape.fill(.black)
-                .shadow(color: .black.opacity(model.phase == .open ? 0.45 : 0), radius: 10, y: 4)
-        }
-        .contentShape(shape)
+        .contentShape(Rectangle())
         .onTapGesture { model.tap() }
         .contextMenu { SettingsMenu(model: model) }
         .animation(Motion.wings, value: model.activity.kind)
+        .animation(Motion.wings, value: model.wingApps)
     }
 
     private var closedLayer: some View {
         VStack(spacing: 0) {
+            // Laid out with wings even when there are none; the silhouette hides them.
             ClosedWings(media: media, agents: agents)
-                .frame(height: model.notch.height)
+                .frame(width: model.notch.width + model.wing * 2, height: model.notch.height)
             if model.phase == .peek {
                 Group {
                     if case .agent(let thread) = model.peek {
@@ -57,10 +52,13 @@ private struct NotchBody: View {
                         TrackPeek(media: media)
                     }
                 }
+                .frame(width: size.width)
                 .transition(.notchContent)
             }
         }
     }
+
+    private var size: CGSize { model.size }
 }
 
 /// Fades, unblurs and grows content in from the top edge, the way the Dynamic Island fills in.
@@ -76,9 +74,32 @@ private struct Reveal: ViewModifier {
 }
 
 extension AnyTransition {
-    static let notchContent = AnyTransition.asymmetric(
+    @MainActor static let notchContent = AnyTransition.asymmetric(
         insertion: .modifier(active: Reveal(shown: false), identity: Reveal(shown: true)).animation(Motion.reveal),
         removal: .modifier(active: Reveal(shown: false), identity: Reveal(shown: true)).animation(Motion.hide))
+
+    /// Wing content slides and grows out from under the camera (`anchor` is the side facing it),
+    /// unblurring as it arrives, and tucks back under it as it leaves.
+    @MainActor static func wing(_ anchor: UnitPoint) -> AnyTransition {
+        .asymmetric(
+            insertion: .modifier(active: WingReveal(shown: false, anchor: anchor),
+                                 identity: WingReveal(shown: true, anchor: anchor)).animation(Motion.wingIn),
+            removal: .modifier(active: WingReveal(shown: false, anchor: anchor),
+                               identity: WingReveal(shown: true, anchor: anchor)).animation(Motion.wingOut))
+    }
+}
+
+private struct WingReveal: ViewModifier {
+    var shown: Bool
+    var anchor: UnitPoint
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(shown ? 1 : 0.35, anchor: anchor)
+            .offset(x: shown ? 0 : (anchor == .trailing ? 9 : -9))
+            .blur(radius: shown ? 0 : 4)
+            .opacity(shown ? 1 : 0)
+    }
 }
 
 private struct OpenLayer: View {
@@ -135,10 +156,10 @@ private struct ClosedWings: View {
     var body: some View {
         HStack(spacing: 0) {
             leading
-                .frame(width: model.hasWings ? model.wing : 0)
+                .frame(width: model.wing)
             Spacer(minLength: model.notch.width)
             trailing
-                .frame(width: model.hasWings ? model.wing : 0)
+                .frame(width: model.wing)
         }
         .frame(height: model.notch.height)
     }
@@ -147,19 +168,30 @@ private struct ClosedWings: View {
         switch model.activity {
         case _ where isAgentPeek:
             Color.clear // the peek card below already shows the app icon
-        case .needsYou(let thread, _), .finished(let thread, _), .unread(let thread, _), .working(let thread, _):
-            AppIcon(bundleID: thread.bundleID, size: 18)
-                .id(thread.bundleID)
-                .transition(.scale(0.5).combined(with: .opacity))
+        case .needsYou, .finished, .unread, .working:
+            let layout = model.wingLogoLayout, piled = layout.spacing < 0
+            HStack(spacing: layout.spacing) {
+                ForEach(Array(model.wingApps.enumerated()), id: \.element) { index, app in
+                    AppIcon(bundleID: app, size: layout.size)
+                        // A black rim separates piled logos; the leftmost sits on top.
+                        .background(Circle().fill(.black).padding(piled ? -1.5 : 0))
+                        .zIndex(-Double(index))
+                        .transition(.scale(0.5).combined(with: .opacity))
+                }
+            }
+            .padding(.leading, piled ? 1 : 0) // breathing room from the notch's left edge
+            .transition(.wing(.trailing))
         case .playing:
             Group {
                 if media.isYouTube {
                     YouTubeLogo(height: 13)
+                } else if let icon = media.site?.icon {
+                    SiteIcon(image: icon, size: 18)
                 } else {
                     Artwork(image: media.artwork, bundleID: media.now.bundleID, size: 18, radius: 5)
                 }
             }
-            .transition(.scale(0.5).combined(with: .opacity))
+            .transition(.wing(.trailing))
         case .idle:
             Color.clear
         }
@@ -169,16 +201,16 @@ private struct ClosedWings: View {
         switch model.activity {
         case .needsYou(_, let count):
             Badge(count: count, color: .orange, symbol: "exclamationmark")
-                .transition(.scale(0.3).combined(with: .opacity))
+                .transition(.wing(.leading))
         case .finished(_, let failed), .unread(_, let failed):
             Image(systemName: failed ? "xmark.circle.fill" : "checkmark.circle.fill")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(failed ? .red : .green)
-                .transition(.scale(0.3).combined(with: .opacity))
+                .transition(.wing(.leading))
         case .playing:
             Equalizer(color: media.tint, playing: true)
                 .frame(width: 14, height: 11)
-                .transition(.opacity)
+                .transition(.wing(.leading))
         case .working(_, let count):
             Thinking(size: 15)
                 .overlay(alignment: .bottomTrailing) {
@@ -188,7 +220,7 @@ private struct ClosedWings: View {
                             .offset(x: 5, y: 4)
                     }
                 }
-            .transition(.opacity)
+            .transition(.wing(.leading))
         case .idle:
             Color.clear
         }
@@ -225,10 +257,14 @@ private struct TrackPeek: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            if media.isYouTube { YouTubeLogo(height: 10) }
+            if media.isYouTube {
+                YouTubeLogo(height: 10)
+            } else if let icon = media.site?.icon {
+                SiteIcon(image: icon, size: 13)
+            }
             Text(media.now.title).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
-            if !media.now.artist.isEmpty {
-                Text(media.now.artist).font(.system(size: 11)).foregroundStyle(.white.opacity(0.5))
+            if !media.subtitle.isEmpty {
+                Text(media.subtitle).font(.system(size: 11)).foregroundStyle(.white.opacity(0.5))
             }
         }
         .lineLimit(1)
@@ -348,12 +384,15 @@ private struct MediaPanel: View {
         } else {
             HStack(spacing: 12) {
                 let artSize = media.now.isVideo ? CGSize(width: 112, height: 63) : CGSize(width: 68, height: 68)
-                Artwork(image: media.artwork, bundleID: media.now.bundleID, size: artSize.height, width: artSize.width,
+                Artwork(image: media.artwork, bundleID: media.now.bundleID, icon: media.site?.icon,
+                        size: artSize.height, width: artSize.width,
                         radius: media.now.isVideo ? 10 : 12)
                     .overlay(alignment: .bottomTrailing) {
                         Group {
                             if media.isYouTube {
                                 YouTubeLogo(height: 12).padding(5)
+                            } else if let icon = media.site?.icon {
+                                if media.artwork != nil { SiteIcon(image: icon, size: 16).offset(x: 4, y: 4) }
                             } else {
                                 AppIcon(bundleID: media.now.bundleID, size: 16).offset(x: 4, y: 4)
                             }
@@ -363,13 +402,13 @@ private struct MediaPanel: View {
                     .opacity(media.now.playing ? 1 : 0.75)
                     .animation(Motion.open, value: media.now.playing)
                     .onTapGesture { media.openSource() }
-                    .help(media.isYouTube ? "Open YouTube tab" : "Open player")
+                    .help(media.site.map { "Open \($0.name)" } ?? "Open player")
 
                 VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(media.now.title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
-                            Text(media.now.artist).font(.system(size: 10)).foregroundStyle(.white.opacity(0.5))
+                            Text(media.subtitle).font(.system(size: 10)).foregroundStyle(.white.opacity(0.5))
                         }
                         .lineLimit(1)
                         Spacer(minLength: 6)
@@ -536,11 +575,28 @@ private struct AgentsPanel: View {
                             withAnimation(.spring(response: 0.3)) { agents.dismiss(thread) }
                         }
                         .transition(.opacity.combined(with: .move(edge: .top)))
+                        // Right-click works even when the row's hover didn't register.
+                        .contextMenu {
+                            Button("Dismiss") { withAnimation(.spring(response: 0.3)) { agents.dismiss(thread) } }
+                            Button("Clear All Done") { withAnimation(.spring(response: 0.3)) { agents.dismissDone() } }
+                                .disabled(!agents.threads.contains { $0.state.isFinished && !$0.state.isFailed })
+                            Divider()
+                            SettingsMenu(model: model)
+                        }
                     }
                 }
                 .padding(.bottom, 8)
             }
             .scrollBounceBehavior(.basedOnSize)
+            // The panel never grows: past three rows the list scrolls, and the fade says there's more.
+            .mask {
+                VStack(spacing: 0) {
+                    Rectangle()
+                    if agents.threads.count > 3 {
+                        LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom).frame(height: 14)
+                    }
+                }
+            }
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: agents.threads.map(\.id))
         }
     }
@@ -565,18 +621,19 @@ private struct AgentRow: View {
                 StateLabel(thread: thread)
             }
             Spacer(minLength: 8)
-            if hovered && thread.state.rank <= 2 {
-                Button(action: dismiss) {
-                    Image(systemName: "xmark").font(.system(size: 7, weight: .bold)).foregroundStyle(.white.opacity(0.6))
-                        .frame(width: 16, height: 16).background(Circle().fill(.white.opacity(0.12)))
-                }
-                .buttonStyle(PressStyle())
-                .help("Dismiss")
-            } else {
-                StateGlyph(state: thread.state)
+            StateGlyph(state: thread.state)
+            // Always there (SwiftUI's hover can miss in this panel), brighter under the pointer.
+            Button(action: dismiss) {
+                Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white.opacity(hovered ? 0.7 : 0.3))
+                    .frame(width: 18, height: 18).background(Circle().fill(.white.opacity(hovered ? 0.12 : 0.06)))
+                    .frame(width: 28, height: 30).contentShape(Rectangle())
             }
+            .buttonStyle(PressStyle())
+            .help(thread.state.isWorking ? "Hide until it changes" : "Dismiss")
         }
-        .padding(.horizontal, 8)
+        .padding(.leading, 8)
+        .padding(.trailing, 1)
         .frame(height: 30)
         .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(.white.opacity(hovered ? 0.08 : 0)))
         .contentShape(Rectangle())
@@ -600,7 +657,7 @@ struct StateLabel: View {
 
     private func text(now: Date) -> String {
         switch thread.state {
-        case .needsInput(let detail): "\(thread.appName) · \(detail.isEmpty ? "Needs your input" : detail)"
+        case .needsInput(let detail, _): "\(thread.appName) · \(detail.isEmpty ? "Needs your input" : detail)"
         case .failed(let at): "\(thread.appName) · Failed \(ago(at, now))"
         case .done(let at): "\(thread.appName) · Done \(ago(at, now))"
         case .working(let since): "\(thread.appName) · Working · \(duration(since, now))"
@@ -646,6 +703,8 @@ struct SettingsMenu: View {
     @ObservedObject var model: NotchModel
 
     var body: some View {
+        Button("Settings…") { model.showSettings?() }
+        Divider()
         Toggle("Open on Hover", isOn: $model.openOnHover)
         Toggle("Launch at Login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
         Divider()
@@ -658,6 +717,8 @@ struct SettingsMenu: View {
 struct Artwork: View {
     let image: NSImage?
     let bundleID: String
+    /// Shown instead of the app's icon while there's no artwork (the website's icon).
+    var icon: NSImage?
     var size: CGFloat
     var width: CGFloat?
     var radius: CGFloat
@@ -670,7 +731,11 @@ struct Artwork: View {
             } else {
                 ZStack {
                     shape.fill(.white.opacity(0.08))
-                    AppIcon(bundleID: bundleID, size: size * 0.55)
+                    if let icon {
+                        SiteIcon(image: icon, size: size * 0.5)
+                    } else {
+                        AppIcon(bundleID: bundleID, size: size * 0.55)
+                    }
                 }
             }
         }
@@ -699,6 +764,18 @@ struct YouTubeLogo: View {
                 .frame(width: height * 0.42 * 0.95, height: height * 0.42)
                 .offset(x: height * 0.03)
             }
+    }
+}
+
+/// A website's icon, rounded like an app icon (favicons are often square-cornered).
+struct SiteIcon: View {
+    let image: NSImage
+    let size: CGFloat
+
+    var body: some View {
+        Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
     }
 }
 

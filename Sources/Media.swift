@@ -4,7 +4,6 @@ import AppKit
 struct NowPlaying: Equatable {
     var title = ""
     var artist = ""
-    var album = ""
     var bundleID = ""
     var duration: Double = 0
     var elapsed: Double = 0
@@ -12,6 +11,13 @@ struct NowPlaying: Equatable {
     var playing = false
 
     var isEmpty: Bool { title.isEmpty }
+
+    /// Which track this is. The same title from another player or artist is a different one.
+    struct Key: Equatable {
+        var bundleID = "", title = "", artist = ""
+    }
+
+    var key: Key { Key(bundleID: bundleID, title: title, artist: artist) }
 
     /// Browsers report YouTube & co.; they get a 16:9 artwork frame and ±10 s skips.
     var isVideo: Bool { NowPlaying.browsers.contains(bundleID) }
@@ -21,11 +27,16 @@ struct NowPlaying: Equatable {
         return duration > 0 ? min(max(value, 0), duration) : max(value, 0)
     }
 
-    static let browsers: Set<String> = [
-        "com.apple.Safari", "app.zen-browser.zen", "org.mozilla.firefox", "com.google.Chrome",
-        "company.thebrowser.Browser", "company.thebrowser.dia", "com.brave.Browser", "com.microsoft.edgemac",
-        "com.vivaldi.Vivaldi", "com.kagi.kagimacOS", "ai.perplexity.comet", "com.openai.atlas",
-    ]
+    /// Every installed app that can open web pages, plus the common ones in case they're installed later.
+    static let browsers: Set<String> = {
+        let installed = URL(string: "https://example.com").map { NSWorkspace.shared.urlsForApplications(toOpen: $0) } ?? []
+        return Set(installed.compactMap { Bundle(url: $0)?.bundleIdentifier }).union([
+            "com.apple.Safari", "app.zen-browser.zen", "org.mozilla.firefox", "com.google.Chrome",
+            "company.thebrowser.Browser", "company.thebrowser.dia", "com.brave.Browser", "com.microsoft.edgemac",
+            "com.vivaldi.Vivaldi", "com.kagi.kagimacOS", "ai.perplexity.comet", "com.openai.atlas", "net.imput.helium",
+            "org.chromium.Chromium", "com.operasoftware.Opera",
+        ])
+    }()
 }
 
 @MainActor
@@ -35,14 +46,27 @@ final class MediaController: ObservableObject {
     @Published private(set) var tint = Color.white
     /// Bumped on real track changes (not on pause/seek) so the notch can peek.
     @Published private(set) var trackChange = 0
-    /// The browser is playing a YouTube video we found the tab for.
-    @Published private(set) var isYouTube = false
+    /// The web page a browser is playing from, once its tab is found.
+    @Published private(set) var site: Site?
+
+    struct Site {
+        let key: NowPlaying.Key
+        let name: String
+        let icon: NSImage?
+        let isYouTube: Bool
+    }
+
+    var isYouTube: Bool { site?.isYouTube == true }
+    /// Websites often send no artist; the site's name stands in.
+    var subtitle: String { now.artist.isEmpty ? site?.name ?? "" : now.artist }
 
     private var remoteArt: NSImage?
     private var seeded = false
-    private var thumbnail: (title: String, image: NSImage)?
-    private var lookupTitle = ""
-    private let lookupQueue = DispatchQueue(label: "nook.youtube", qos: .utility)
+    private var thumbnail: (key: NowPlaying.Key, image: NSImage)?
+    private var lookupKey: NowPlaying.Key?
+    private var lookupTask: Task<Void, Never>?
+    /// Tab lookups run AppleScript and file reads, one at a time, off the main thread.
+    private let lookupQueue = DispatchQueue(label: "nook.webpage", qos: .utility)
 
     private var process: Process?
     private var input: FileHandle?
@@ -51,26 +75,41 @@ final class MediaController: ObservableObject {
 
     init() { start() }
 
-    func send(_ command: String) {
-        try? input?.write(contentsOf: Data((command + "\n").utf8))
+    /// What the helper understands, one per line on its stdin.
+    private enum Command {
+        case toggle, next, previous, seek(Double)
+
+        var line: String {
+            switch self {
+            case .toggle: "toggle"
+            case .next: "next"
+            case .previous: "prev"
+            case .seek(let seconds): "seek \(seconds)"
+            }
+        }
     }
 
+    private func send(_ command: Command) {
+        try? input?.write(contentsOf: Data((command.line + "\n").utf8))
+    }
+
+    // Controls update the UI optimistically so they feel instant. The helper always reports the
+    // player's actual state shortly after a command, which corrects it if the player said no.
     func toggle() {
-        // Optimistic: flip immediately so the button feels instant; the helper confirms right after.
         now.elapsed = now.position()
         now.sampledAt = Date()
         now.playing.toggle()
-        send("toggle")
+        send(.toggle)
     }
 
-    func next() { now.isVideo ? seek(to: now.position() + 10) : send("next") }
-    func previous() { now.isVideo ? seek(to: now.position() - 10) : send("prev") }
+    func next() { now.isVideo ? seek(to: now.position() + 10) : send(.next) }
+    func previous() { now.isVideo ? seek(to: now.position() - 10) : send(.previous) }
 
     func seek(to seconds: Double) {
         let target = max(0, now.duration > 0 ? min(seconds, now.duration) : seconds)
         now.elapsed = target
         now.sampledAt = Date()
-        send("seek \(target)")
+        send(.seek(target))
     }
 
     func openSource() {
@@ -119,68 +158,88 @@ final class MediaController: ObservableObject {
         while let newline = buffer.firstIndex(of: 0x0A) {
             let line = buffer[buffer.startIndex..<newline]
             buffer.removeSubrange(buffer.startIndex...newline)
-            if let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any] { apply(json) }
+            if let snapshot = try? JSONDecoder().decode(Snapshot.self, from: line) { apply(snapshot) }
         }
     }
 
-    private func apply(_ json: [String: Any]) {
+    /// One line from the helper (Helper/NookMedia.m). `art` is only sent when it changes; `hasArt`
+    /// says the player still has some.
+    private struct Snapshot: Decodable {
+        var title: String?
+        var artist: String?
+        var bundle: String?
+        var duration: Double?
+        var elapsed: Double?
+        var ts: Double?
+        var rate: Double?
+        var playing: Bool?
+        var art: String?
+        var hasArt: Bool?
+    }
+
+    private func apply(_ snapshot: Snapshot) {
         var next = NowPlaying()
-        next.title = json["title"] as? String ?? ""
-        next.artist = json["artist"] as? String ?? ""
-        next.album = json["album"] as? String ?? ""
-        next.bundleID = json["bundle"] as? String ?? ""
-        next.duration = (json["duration"] as? NSNumber)?.doubleValue ?? 0
-        next.elapsed = (json["elapsed"] as? NSNumber)?.doubleValue ?? 0
-        next.sampledAt = (json["ts"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) } ?? Date()
-        let rate = (json["rate"] as? NSNumber)?.doubleValue ?? 0
-        next.playing = ((json["playing"] as? NSNumber)?.boolValue ?? false) && (rate > 0 || json["rate"] == nil)
+        next.title = snapshot.title ?? ""
+        next.artist = snapshot.artist ?? ""
+        next.bundleID = snapshot.bundle ?? ""
+        next.duration = snapshot.duration ?? 0
+        next.elapsed = snapshot.elapsed ?? 0
+        next.sampledAt = snapshot.ts.map(Date.init(timeIntervalSince1970:)) ?? Date()
+        next.playing = (snapshot.playing ?? false) && (snapshot.rate.map { $0 > 0 } ?? true)
 
         let trackChanged = next.title != now.title || next.artist != now.artist
-        if let encoded = json["art"] as? String, let data = Data(base64Encoded: encoded), let image = NSImage(data: data) {
+        if let encoded = snapshot.art, let data = Data(base64Encoded: encoded), let image = NSImage(data: data) {
             remoteArt = image
-        } else if json["hasArt"] == nil {
+        } else if snapshot.hasArt == nil {
             remoteArt = nil
         }
         if next != now { now = next }
-        if next.isVideo && !next.title.isEmpty && next.title != lookupTitle {
-            lookupTitle = next.title
-            findVideo(title: next.title, browser: next.bundleID, attempt: 0)
+        if site?.key != next.key { site = nil }
+        if next.isVideo && !next.title.isEmpty {
+            if next.key != lookupKey { findPage(for: next.key) }
+        } else {
+            lookupTask?.cancel()
+            lookupKey = nil
         }
-        if thumbnail?.title != next.title && isYouTube { isYouTube = false }
         updateArtwork()
         // The first update after launch is what was already playing, not a change.
         if trackChanged && !next.isEmpty && next.playing && seeded { trackChange += 1 }
         seeded = true
     }
 
-    /// Browser artwork when it sends some, otherwise the YouTube thumbnail for this video.
+    /// Browser artwork when it sends some, otherwise the thumbnail of the page it's playing.
     private func updateArtwork() {
-        let image = remoteArt ?? (thumbnail?.title == now.title ? thumbnail?.image : nil)
+        let image = remoteArt ?? (thumbnail?.key == now.key ? thumbnail?.image : nil)
         guard image !== artwork else { return }
         artwork = image
         tint = image?.vibrantTint ?? .white
     }
 
-    /// A video's page can take a moment to reach the browser's history (or tabs) under its final
-    /// title, so it's retried quickly at first, then backing off, for about a minute.
-    private static let retryDelays: [Double] = [0.4, 0.8, 1.2, 2, 3, 5, 8, 12, 15, 15]
+    /// A page can take a moment to reach the browser's history (or tabs) under its final title,
+    /// so it's retried quickly at first, then backing off, for about a minute.
+    private static let retryDelays: [Double] = [0, 0.4, 0.8, 1.2, 2, 3, 5, 8, 12, 15, 15]
 
-    private func findVideo(title: String, browser: String, attempt: Int) {
-        lookupQueue.async { [weak self] in
-            let id = YouTube.videoID(title: title, browser: browser)
-            Task { @MainActor in
-                guard let self, self.now.title == title else { return }
-                if let id {
-                    guard let image = await YouTube.thumbnail(id), self.now.title == title else { return }
-                    self.thumbnail = (title, image)
-                    self.isYouTube = true
-                    self.updateArtwork()
-                } else if attempt < Self.retryDelays.count {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryDelays[attempt]) { [weak self] in
-                        guard let self, self.now.title == title else { return }
-                        self.findVideo(title: title, browser: browser, attempt: attempt + 1)
-                    }
+    /// Finds the page `track` plays from, then its preview. A newer track cancels this one,
+    /// downloads included, so a late answer can never land on the wrong track.
+    private func findPage(for track: NowPlaying.Key) {
+        lookupTask?.cancel()
+        lookupKey = track
+        let queue = lookupQueue
+        lookupTask = Task { [weak self] in
+            for delay in Self.retryDelays {
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+                let page = await withCheckedContinuation { done in
+                    queue.async { done.resume(returning: WebPage.url(title: track.title, artist: track.artist, browser: track.bundleID)) }
                 }
+                guard !Task.isCancelled else { return }
+                guard let page else { continue }
+                let preview = await WebPage.preview(page)
+                guard !Task.isCancelled, let self, self.now.key == track else { return }
+                if let image = preview.image { self.thumbnail = (track, NSImage(cgImage: image, size: .zero)) }
+                self.site = Site(key: track, name: preview.name, icon: preview.icon.map { NSImage(cgImage: $0, size: .zero) },
+                                 isYouTube: preview.isYouTube)
+                self.updateArtwork()
+                return
             }
         }
     }

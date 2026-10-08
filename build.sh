@@ -21,7 +21,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleDisplayName</key><string>Nook</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
-	<key>NSAppleEventsUsageDescription</key><string>Nook reads your browser's tabs to show the thumbnail of the YouTube video you're playing.</string>
+	<key>NSAppleEventsUsageDescription</key><string>Nook reads your browser's tabs to show the website and thumbnail of the video you're playing, and brings up the terminal tab an agent runs in.</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>LSMinimumSystemVersion</key><string>14.0</string>
 	<key>LSUIElement</key><true/>

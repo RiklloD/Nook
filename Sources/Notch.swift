@@ -17,12 +17,14 @@ enum Peek: Equatable {
 /// 1. an agent needs you  2. an agent finished and you haven't hovered it yet  3. media playing
 /// 4. finishes you've seen but not clicked (so they resurface when you pause)  5. agents working
 /// 6. nothing (the notch disappears into the camera).
+/// Agent cases carry the distinct apps involved (bundle IDs, list order), so two harnesses show
+/// two logos side by side and two threads of the same one show it once.
 enum Activity: Equatable {
-    case needsYou(AgentThread, count: Int)
-    case finished(AgentThread, failed: Bool)
+    case needsYou(apps: [String], count: Int)
+    case finished(apps: [String], failed: Bool)
     case playing
-    case unread(AgentThread, failed: Bool)
-    case working(AgentThread, count: Int)
+    case unread(apps: [String], failed: Bool)
+    case working(apps: [String], count: Int)
     case idle
 
     var kind: Int {
@@ -40,20 +42,42 @@ enum Activity: Equatable {
 /// Every curve is a spring, so any motion can be interrupted mid-flight and the next one picks up
 /// its velocity instead of restarting from rest (hover → open, open → close, drag → settle).
 enum Motion {
-    /// Expanding: a touch of life at the end, like the Dynamic Island.
+    /// The silhouette's springs. They run in Core Animation (see `NotchSilhouette`), not SwiftUI.
+    enum Shape {
+        /// Expanding: unhurried enough to read as one continuous gesture, with a touch of life at
+        /// the end like the Dynamic Island.
+        static let open = Spring(duration: 0.37, bounce: 0.2)
+        /// Collapsing: critically damped, so nothing wobbles into the camera.
+        static let close = Spring(duration: 0.4, bounce: 0)
+        /// The small "I see you" swell under the pointer; its velocity carries into `open`.
+        static let hover = Spring(duration: 0.26, bounce: 0.22)
+        /// Wings growing out of the camera, overshooting a hair past their width...
+        static let widen = Spring(duration: 0.4, bounce: 0.24)
+        /// ...and folding back into it, easing all the way in.
+        static let narrow = Spring(duration: 0.44, bounce: 0)
+    }
+
     static let open = Animation.spring(duration: 0.28, bounce: 0.2)
-    /// Collapsing: quick and critically damped, nothing wobbles into the camera.
     static let close = Animation.spring(duration: 0.36, bounce: 0)
-    /// The small "I see you" swell under the pointer; hands its velocity to `open`.
     static let hover = Animation.spring(duration: 0.21, bounce: 0.15)
     static let wings = Animation.spring(duration: 0.42, bounce: 0.12)
+    /// Wing content comes out once the edge has started moving...
+    static let wingIn = Animation.spring(duration: 0.34, bounce: 0.16).delay(0.064)
+    /// ...and is mostly gone before the edge reaches the camera.
+    static let wingOut = Animation.smooth(duration: 0.2)
     /// Content arrives a beat after the shape starts moving and leaves before it finishes.
-    static let reveal = Animation.spring(duration: 0.26, bounce: 0).delay(0.03)
+    static let reveal = Animation.spring(duration: 0.27, bounce: 0).delay(0.04)
     static let hide = Animation.smooth(duration: 0.15)
     /// Follows the fingers, smoothing trackpad events that don't line up with display frames.
     static let track = Animation.interactiveSpring(duration: 0.1, extraBounce: 0)
     /// Lands on a page, inheriting the release velocity from `track`.
     static let settle = Animation.spring(duration: 0.42, bounce: 0.1)
+}
+
+/// SwiftUI's `.spring(duration:bounce:)` parameters, for Core Animation.
+struct Spring: Equatable {
+    var duration: Double
+    var bounce: Double
 }
 
 @MainActor
@@ -76,6 +100,8 @@ final class NotchModel: ObservableObject {
     /// A one-off swell that announces a finish without opening anything.
     @Published private(set) var nudging = false
     private var outsideClick: Any?
+    /// Set by the app delegate, which owns the Settings window.
+    var showSettings: (() -> Void)?
     private var observers: [AnyCancellable] = []
 
     static let openSize = CGSize(width: 420, height: 106) // body below the notch
@@ -97,19 +123,32 @@ final class NotchModel: ObservableObject {
 
     var activity: Activity {
         let threads = agents.threads
-        let waiting = threads.filter { $0.state.rank == 0 }
-        if let first = waiting.first { return .needsYou(first, count: waiting.count) }
-        // Finished threads stay listed until you click them (or dismiss them), then drop out.
+        let waiting = threads.filter(\.state.isWaiting)
+        if !waiting.isEmpty { return .needsYou(apps: Self.apps(waiting), count: waiting.count) }
+        // Finishes you haven't hovered yet are announced; successes then age out, failures wait for you.
         let finished = unseenFinishes
-        if let first = finished.first {
-            return .finished(first, failed: finished.contains { $0.state.rank == 1 })
+        if !finished.isEmpty {
+            return .finished(apps: Self.apps(finished), failed: finished.contains(where: \.state.isFailed))
         }
         if media.now.playing { return .playing }
-        let unread = threads.filter { $0.state.rank == 1 || $0.state.rank == 2 }
-        if let first = unread.first { return .unread(first, failed: unread.contains { $0.state.rank == 1 }) }
-        let working = threads.filter { $0.state.rank == 3 }
-        if let first = working.first { return .working(first, count: working.count) }
+        let unread = threads.filter(\.state.isFinished)
+        if !unread.isEmpty { return .unread(apps: Self.apps(unread), failed: unread.contains(where: \.state.isFailed)) }
+        let working = threads.filter(\.state.isWorking)
+        if !working.isEmpty { return .working(apps: Self.apps(working), count: working.count) }
         return .idle
+    }
+
+    private static func apps(_ threads: [AgentThread]) -> [String] {
+        var seen = Set<String>()
+        return threads.map(\.bundleID).filter { seen.insert($0).inserted }
+    }
+
+    /// Logos shown in the closed wings for the current activity.
+    var wingApps: [String] {
+        switch activity {
+        case .needsYou(let apps, _), .finished(let apps, _), .unread(let apps, _), .working(let apps, _): apps
+        case .playing, .idle: []
+        }
     }
 
     // MARK: Geometry
@@ -137,6 +176,13 @@ final class NotchModel: ObservableObject {
     var wing: CGFloat { notch.height - 2 }
     var hasWings: Bool { activity != .idle }
     var closedWidth: CGFloat { notch.width + (hasWings ? wing * 2 : 0) }
+    /// Several logos share the one-logo wing at full size: they spread edge to edge across it and
+    /// overlap as needed (a 30 pt wing fits two 18 pt logos with a third of each tucked under).
+    var wingLogoLayout: (size: CGFloat, spacing: CGFloat) {
+        let size: CGFloat = 18, n = CGFloat(wingApps.count)
+        guard n > 1 else { return (size, 0) }
+        return (size, min(2, (wing - 1 - size) / (n - 1) - size)) // 1 pt clear of the left edge
+    }
     var earRadius: CGFloat { phase == .open ? 9 : 6 }
     var bottomRadius: CGFloat {
         switch phase {
@@ -148,7 +194,7 @@ final class NotchModel: ObservableObject {
 
     /// Finished threads still announced in the closed notch; hovering it counts as seeing them.
     private var unseenFinishes: [AgentThread] {
-        agents.threads.filter { ($0.state.rank == 1 || $0.state.rank == 2) && !agents.isSeen($0) }
+        agents.threads.filter { $0.state.isFinished && !agents.isSeen($0) }
     }
 
     private var isAgentPeek: Bool {
@@ -179,7 +225,6 @@ final class NotchModel: ObservableObject {
         hoverTask?.cancel()
         if inside {
             glimpsed = unseenFinishes
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
             withAnimation(Motion.hover) { hovering = true }
             peekTimer?.invalidate()
             // An agent notification stays a notification under the pointer, so it can be clicked.
@@ -265,21 +310,17 @@ final class NotchModel: ObservableObject {
     }
 
     /// `velocity` is the finger speed at lift-off in points per second.
-    func endSwipe(_ travel: CGFloat, velocity: CGFloat) {
-        guard phase == .open, let page = pager.release(travel, velocity: velocity) else { return }
+    func endSwipe(velocity: CGFloat) {
+        guard phase == .open, let page = pager.release(velocity: velocity) else { return }
         let next: Tab = page == 0 ? .media : .agents
         guard next != tab else { return }
         NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
-        commit(next)
+        tab = next
     }
 
     func switchTab(_ next: Tab) {
-        commit(next)
-        pager.go(to: next.page)
-    }
-
-    private func commit(_ next: Tab) {
         tab = next
+        pager.go(to: next.page)
     }
 
     /// Follows the same priority as the closed notch.
@@ -325,6 +366,16 @@ final class NotchModel: ObservableObject {
             objectWillChange.send()
         }
     }
+
+    /// Registered, but macOS wants it allowed under Login Items first.
+    var launchAtLoginNeedsApproval: Bool { SMAppService.mainApp.status == .requiresApproval }
+
+    /// Turns launch at login on the first time Nook runs; after that it's the user's switch.
+    func enableLaunchAtLoginOnce() {
+        guard !UserDefaults.standard.bool(forKey: "launchAtLoginSetUp") else { return }
+        UserDefaults.standard.set(true, forKey: "launchAtLoginSetUp")
+        if SMAppService.mainApp.status != .enabled { launchAtLogin = true }
+    }
 }
 
 // MARK: - Pager
@@ -367,7 +418,7 @@ final class Pager: ObservableObject {
 
     /// Picks the page from where a flick would coast to, not just where the fingers stopped.
     /// Returns the page it settles on, or nil when no drag was in progress.
-    func release(_ travel: CGFloat, velocity: CGFloat) -> Int? {
+    func release(velocity: CGFloat) -> Int? {
         guard dragging else { return nil }
         dragging = false
         let pageVelocity = -velocity / Self.stride
@@ -419,32 +470,123 @@ final class Pager: ObservableObject {
     }
 }
 
-// MARK: - Shape
+// MARK: - Silhouette
 
-/// The notch silhouette: concave "ears" melting into the menu bar, rounded bottom corners.
-struct NotchShape: Shape {
-    var ear: CGFloat
-    var bottom: CGFloat
-
-    var animatableData: AnimatablePair<CGFloat, CGFloat> {
-        get { AnimatablePair(ear, bottom) }
-        set { ear = newValue.first; bottom = newValue.second }
+/// The notch's black shape, as Core Animation layers: a body with rounded bottom corners and two
+/// concave "ears" melting into the menu bar. Its springs run in the render server, so every frame
+/// lands exactly on the display's clock; SwiftUI's own animations step unevenly at 120 Hz, which
+/// reads as judder on a large moving edge. Every spring is additive: a new target adds a spring
+/// from the old target to the new one on top of those still running, so the motion keeps its
+/// velocity through any interruption, the way UIKit and the Dynamic Island retarget.
+@MainActor
+final class NotchSilhouette {
+    struct Geometry: Equatable {
+        var width: CGFloat // the body, ears excluded
+        var height: CGFloat
+        var ear: CGFloat
+        var bottom: CGFloat
+        var shadow: Float
     }
 
-    func path(in rect: CGRect) -> Path {
-        let w = rect.width, h = rect.height
-        let b = min(bottom, (w - ear * 2) / 2, h - ear)
-        var path = Path()
-        path.move(to: CGPoint(x: 0, y: 0))
-        path.addQuadCurve(to: CGPoint(x: ear, y: ear), control: CGPoint(x: ear, y: 0))
-        path.addLine(to: CGPoint(x: ear, y: h - b))
-        path.addQuadCurve(to: CGPoint(x: ear + b, y: h), control: CGPoint(x: ear, y: h))
-        path.addLine(to: CGPoint(x: w - ear - b, y: h))
-        path.addQuadCurve(to: CGPoint(x: w - ear, y: h - b), control: CGPoint(x: w - ear, y: h))
-        path.addLine(to: CGPoint(x: w - ear, y: ear))
-        path.addQuadCurve(to: CGPoint(x: w, y: 0), control: CGPoint(x: w - ear, y: 0))
-        path.closeSubpath()
-        return path
+    /// The visible black shape (and its shadow).
+    let fill = CALayer()
+    /// The same shape, clipping the content. Ears are left out: nothing is drawn in them.
+    let mask = CALayer()
+    private let body = CALayer()
+    private let leftEar = CAShapeLayer()
+    private let rightEar = CAShapeLayer()
+    private let canvas: CGSize
+    private var current: Geometry?
+
+    init(canvas: CGSize) {
+        self.canvas = canvas
+        fill.frame = CGRect(origin: .zero, size: canvas)
+        for layer in [body, mask] {
+            // Pinned at the top center (layers here have a bottom-left origin), so only the size moves.
+            layer.anchorPoint = CGPoint(x: 0.5, y: 1)
+            layer.position = CGPoint(x: canvas.width / 2, y: canvas.height)
+            layer.backgroundColor = .black
+            layer.cornerCurve = .continuous
+            layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        }
+        body.shadowColor = .black
+        body.shadowRadius = 10
+        body.shadowOffset = CGSize(width: 0, height: -4)
+        body.shadowOpacity = 0
+        // Unit-sized fillets, scaled to the ear radius. Each one's corner that touches the body's
+        // top edge is its anchor, so it sits on the body's top corner.
+        let left = CGMutablePath()
+        left.move(to: CGPoint(x: 0, y: 1))
+        left.addQuadCurve(to: CGPoint(x: 1, y: 0), control: CGPoint(x: 1, y: 1))
+        left.addLine(to: CGPoint(x: 1, y: 1))
+        left.closeSubpath()
+        let right = CGMutablePath()
+        right.move(to: CGPoint(x: 0, y: 0))
+        right.addQuadCurve(to: CGPoint(x: 1, y: 1), control: CGPoint(x: 0, y: 1))
+        right.addLine(to: CGPoint(x: 0, y: 1))
+        right.closeSubpath()
+        for (ear, path, anchor) in [(leftEar, left, CGPoint(x: 1, y: 1)), (rightEar, right, CGPoint(x: 0, y: 1))] {
+            ear.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+            ear.path = path
+            ear.fillColor = .black
+            ear.anchorPoint = anchor
+        }
+        fill.addSublayer(body)
+        fill.addSublayer(leftEar)
+        fill.addSublayer(rightEar)
+    }
+
+    func set(_ new: Geometry, spring: Spring?) {
+        guard new != current else { return }
+        let old = current
+        current = new
+        CATransaction.begin()
+        CATransaction.setDisableActions(true) // no implicit animations; only the springs below
+        defer { CATransaction.commit() }
+        for layer in [body, mask] {
+            layer.bounds = CGRect(x: 0, y: 0, width: new.width, height: new.height)
+            layer.cornerRadius = new.bottom
+        }
+        body.shadowOpacity = new.shadow
+        leftEar.position = CGPoint(x: (canvas.width - new.width) / 2, y: canvas.height)
+        rightEar.position = CGPoint(x: (canvas.width + new.width) / 2, y: canvas.height)
+        // Transforms don't add up like numbers, so the ears' size springs from where it is on screen.
+        let earFrom = leftEar.presentation()?.transform ?? leftEar.transform
+        for ear in [leftEar, rightEar] { ear.transform = CATransform3DMakeScale(new.ear, new.ear, 1) }
+        guard let old, let spring else { return }
+
+        let widen = new.width - old.width
+        for layer in [body, mask] {
+            animate(layer, "bounds.size.width", by: widen, spring)
+            animate(layer, "bounds.size.height", by: new.height - old.height, spring)
+            animate(layer, "cornerRadius", by: new.bottom - old.bottom, spring)
+        }
+        animate(body, "shadowOpacity", by: CGFloat(new.shadow - old.shadow), spring)
+        // The ears ride the body's edges on the very same spring, so they never come apart.
+        animate(leftEar, "position.x", by: -widen / 2, spring)
+        animate(rightEar, "position.x", by: widen / 2, spring)
+        if new.ear != old.ear {
+            for ear in [leftEar, rightEar] {
+                let animation = CASpringAnimation(perceptualDuration: spring.duration, bounce: spring.bounce)
+                animation.keyPath = "transform"
+                animation.fromValue = earFrom
+                animation.toValue = ear.transform
+                animation.duration = animation.settlingDuration
+                ear.add(animation, forKey: "size")
+            }
+        }
+    }
+
+    /// Springs `keyPath` from `delta` behind its new value to zero, on top of any running springs.
+    private func animate(_ layer: CALayer, _ keyPath: String, by delta: CGFloat, _ spring: Spring) {
+        guard delta != 0 else { return }
+        let animation = CASpringAnimation(perceptualDuration: spring.duration, bounce: spring.bounce)
+        animation.keyPath = keyPath
+        animation.isAdditive = true
+        animation.fromValue = -delta
+        animation.toValue = 0
+        animation.duration = animation.settlingDuration
+        layer.add(animation, forKey: nil)
     }
 }
 
@@ -466,8 +608,8 @@ final class NotchPanel: NSPanel {
 /// Two-finger horizontal trackpad swipes switch tabs; vertical ones pass through to scroll lists.
 final class SwipeTracker {
     var onChange: ((CGFloat) -> Void)?
-    /// Travel and lift-off velocity (points per second).
-    var onEnd: ((CGFloat, CGFloat) -> Void)?
+    /// Lift-off velocity (points per second).
+    var onEnd: ((CGFloat) -> Void)?
     private var travel = CGSize.zero
     private var samples: [(time: TimeInterval, x: CGFloat)] = [] // the last ~80 ms of travel
     private var horizontal: Bool? // decided by the first few points of travel
@@ -495,7 +637,7 @@ final class SwipeTracker {
         }
         let finished = event.phase.contains(.ended) || event.phase.contains(.cancelled)
         guard horizontal == true else { return false }
-        finished ? onEnd?(travel.width, velocity(at: event.timestamp)) : onChange?(travel.width)
+        finished ? onEnd?(velocity(at: event.timestamp)) : onChange?(travel.width)
         return true
     }
 
@@ -561,7 +703,9 @@ final class NotchWindowController {
     let model = NotchModel()
     let panel: NotchPanel
     private let host: NotchHostingView<AnyView>
+    private let silhouette: NotchSilhouette
     private var observers: [AnyCancellable] = []
+    private var shown: (phase: Phase, wings: Bool, swell: Bool)?
 
     init() {
         panel = NotchPanel(contentRect: CGRect(origin: .zero, size: Self.canvas),
@@ -574,11 +718,25 @@ final class NotchWindowController {
         panel.isMovable = false
         panel.isReleasedWhenClosed = false
         host = NotchHostingView(rootView: AnyView(NotchRoot().environmentObject(model)))
+        silhouette = NotchSilhouette(canvas: Self.canvas)
         host.sizingOptions = []
         host.onHover = { [weak self] inside in self?.model.hover(inside) }
         panel.swipes.onChange = { [weak self] travel in self?.model.swipe(travel) }
-        panel.swipes.onEnd = { [weak self] travel, velocity in self?.model.endSwipe(travel, velocity: velocity) }
-        panel.contentView = host
+        panel.swipes.onEnd = { [weak self] velocity in self?.model.endSwipe(velocity: velocity) }
+        // Bottom to top: the silhouette's black layers, then the SwiftUI content clipped to it.
+        let root = NSView(frame: CGRect(origin: .zero, size: Self.canvas))
+        let backdrop = NSView(frame: root.bounds)
+        backdrop.layer = CALayer()
+        backdrop.wantsLayer = true // layer-hosting: the silhouette owns these layers
+        let clip = NSView(frame: root.bounds)
+        clip.wantsLayer = true
+        host.frame = clip.bounds
+        clip.addSubview(host)
+        root.addSubview(backdrop)
+        root.addSubview(clip)
+        backdrop.layer?.addSublayer(silhouette.fill)
+        clip.layer?.mask = silhouette.mask
+        panel.contentView = root
         place()
         panel.orderFrontRegardless()
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
@@ -587,8 +745,34 @@ final class NotchWindowController {
         }
         // Keep the hover area matched to whatever the notch currently looks like.
         let changes = Publishers.Merge3(model.objectWillChange, model.media.objectWillChange, model.agents.objectWillChange)
-        observers.append(changes.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateHoverRect() })
+        observers.append(changes.receive(on: RunLoop.main).sink { [weak self] _ in
+            self?.updateShape()
+            self?.updateHoverRect()
+        })
+        updateShape()
         updateHoverRect()
+    }
+
+    /// Moves the silhouette to what the model now looks like, with the spring that fits the change.
+    private func updateShape() {
+        let now = (phase: model.phase, wings: model.hasWings, swell: model.hovering || model.nudging)
+        let spring: Spring? = shown.map { was in
+            if was.phase != now.phase {
+                switch now.phase {
+                case .open: return Motion.Shape.open
+                case .closed: return Motion.Shape.close
+                case .peek: return was.phase == .open ? Motion.Shape.close : Motion.Shape.open
+                }
+            }
+            if now.phase == .closed, was.wings != now.wings { return now.wings ? Motion.Shape.widen : Motion.Shape.narrow }
+            if now.phase == .closed, was.swell != now.swell { return Motion.Shape.hover }
+            return Motion.Shape.open // a peek changing what it shows
+        }
+        shown = now
+        let size = model.size
+        silhouette.set(.init(width: size.width, height: size.height, ear: model.earRadius,
+                             bottom: model.bottomRadius, shadow: model.phase == .open ? 0.45 : 0),
+                       spring: spring)
     }
 
     private func updateHoverRect() {
