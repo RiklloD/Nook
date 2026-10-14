@@ -8,6 +8,7 @@
 
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
+#include <math.h>
 
 typedef void (*MRGetInfo)(dispatch_queue_t, void (^)(CFDictionaryRef));
 typedef void (*MRGetIsPlaying)(dispatch_queue_t, void (^)(Boolean));
@@ -81,11 +82,14 @@ static void publish(void) {
                 };
                 for (NSString *key in keys) {
                     id value = info[key];
+                    // Live streams and half-loaded pages report NaN/inf, which NSJSONSerialization
+                    // throws on (that crashed the helper), so leave those out.
+                    if ([value isKindOfClass:NSNumber.class] && !isfinite([value doubleValue])) continue;
                     if ([value isKindOfClass:NSString.class] || [value isKindOfClass:NSNumber.class])
                         out[keys[key]] = value;
                 }
                 NSDate *stamp = info[@"kMRMediaRemoteNowPlayingInfoTimestamp"];
-                if ([stamp isKindOfClass:NSDate.class]) out[@"ts"] = @(stamp.timeIntervalSince1970);
+                if ([stamp isKindOfClass:NSDate.class] && isfinite(stamp.timeIntervalSince1970)) out[@"ts"] = @(stamp.timeIntervalSince1970);
 
                 // Artwork is only sent when it changes; the app keeps the last one otherwise.
                 NSData *art = info[@"kMRMediaRemoteNowPlayingInfoArtworkData"];

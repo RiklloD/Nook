@@ -140,6 +140,11 @@ final class MediaController: ObservableObject {
             try process.run()
             self.process = process
             input = stdin.fileHandleForWriting
+            // A helper that stays up for a minute is healthy: give the restart budget back, so a few
+            // crashes spread over days don't use it up and leave Nook without media for good.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self, weak process] in
+                if let self, let process, process.isRunning, self.process === process { self.restarts = 0 }
+            }
         } catch {
             restartLater()
         }

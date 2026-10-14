@@ -243,18 +243,39 @@ final class AgentReader: @unchecked Sendable {
 
     private func hermes(_ profile: HermesProfile, _ turns: inout HermesTurns, since cutoff: Date) -> [AgentThread]? {
         let now = Date().timeIntervalSince1970
+        // A lease alone isn't a thread: Hermes also takes leases for client-addressed ids that
+        // have no session row (its API/relay turns), and those used to surface as a phantom
+        // "Hermes chat". Only a chat Hermes itself would list counts: a root, or a branch/reset
+        // child (its own chat), never a subagent/compression subchat or an internal worker
+        // (kanban/tool/oneshot), titled by Hermes or, until it writes a title, by its opening
+        // user message; a session with neither isn't a chat yet.
         guard let leases = sqliteQuery(profile.db, """
-            SELECT l.conversation_id AS id, l.acquired_at,
-              COALESCE((SELECT title FROM sessions s WHERE s.id = l.conversation_id), 'Hermes chat') AS title,
-              (SELECT cwd FROM sessions s WHERE s.id = l.conversation_id) AS cwd,
-              (SELECT source FROM sessions s WHERE s.id = l.conversation_id) AS source
-            FROM session_turn_leases l WHERE l.expires_at > \(now)
+            SELECT l.conversation_id AS id, l.acquired_at, s.title AS title,
+              (SELECT m.content FROM messages m WHERE m.session_id = s.id AND m.role = 'user'
+                AND m.content IS NOT NULL ORDER BY m.timestamp LIMIT 1) AS opener,
+              s.cwd AS cwd, s.source AS source
+            FROM session_turn_leases l
+            JOIN sessions s ON s.id = l.conversation_id
+            WHERE l.expires_at > \(now)
+              AND (s.parent_session_id IS NULL
+                OR json_extract(CASE WHEN json_valid(s.model_config) THEN s.model_config ELSE json_object() END, '$._branched_from') IS NOT NULL
+                OR EXISTS (SELECT 1 FROM sessions p WHERE p.id = s.parent_session_id
+                  AND p.end_reason = 'branched' AND s.started_at >= p.ended_at)
+                OR json_extract(CASE WHEN json_valid(s.model_config) THEN s.model_config ELSE json_object() END, '$._reset_from') IS NOT NULL
+                OR EXISTS (SELECT 1 FROM sessions p WHERE p.id = s.parent_session_id
+                  AND p.end_reason IN ('session_reset', 'session_switch', 'idle', 'daily', 'suspended', 'resume_pending_expired')
+                  AND s.session_key IS NOT NULL AND s.session_key != '' AND s.session_key = p.session_key))
+              AND json_extract(CASE WHEN json_valid(s.model_config) THEN s.model_config ELSE json_object() END, '$._delegate_from') IS NULL
+              AND COALESCE(s.source, '') NOT IN ('kanban', 'tool', 'oneshot')
             """) else { return nil }
         var active: [String: (title: String, since: Date)] = [:]
         for row in leases {
-            guard let id = row["id"], let acquired = Double(row["acquired_at"] ?? "") else { continue }
+            guard let id = row["id"], let acquired = Double(row["acquired_at"] ?? ""),
+                  let rawTitle = [row["title"], row["opener"]].compactMap({ $0 }).first(where: {
+                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  }) else { continue }
             turns.places[id] = (row["cwd"] ?? "", row["source"] ?? "")
-            active[id] = (shortTitle(row["title"] ?? "Hermes chat"), Date(timeIntervalSince1970: acquired))
+            active[id] = (shortTitle(rawTitle), Date(timeIntervalSince1970: acquired))
         }
         // A released lease is the only sign on disk that a turn ended; how it ended comes from its
         // last message.
@@ -285,16 +306,34 @@ final class AgentReader: @unchecked Sendable {
             + finished.map { thread($0.key, $0.value.title, $0.value.state) }
     }
 
-    /// A turn that ended on the assistant's final answer finished; one that stopped mid-way (on a
-    /// tool call or result: interrupted, crashed) didn't. Unknown counts as finished.
+    /// How a turn ended, from its own last message only: this conversation plus its compression
+    /// continuations (the same chat, continued), never its subchats — a subagent's last tool
+    /// result must not fail the chat that spawned it. Mirrors Hermes' own session status: an
+    /// error finish is a failure, a trailing user/tool row or pending tool call is a turn
+    /// stopped mid-way, and anything else (a final answer with or without a `stop` marker, no
+    /// messages at all) simply ended.
     private func hermesEndedCleanly(_ conversation: String, in profile: HermesProfile) -> Bool {
         let id = sqlQuote(conversation)
         guard let last = sqliteQuery(profile.db, """
-            SELECT role, finish_reason FROM messages
-            WHERE session_id IN (SELECT id FROM sessions WHERE id = \(id) OR parent_session_id = \(id))
-            ORDER BY timestamp DESC LIMIT 1
+            WITH RECURSIVE lineage(id) AS (
+              SELECT id FROM sessions WHERE id = \(id)
+              UNION
+              SELECT c.id FROM sessions c
+              JOIN lineage l ON c.parent_session_id = l.id
+              JOIN sessions p ON p.id = l.id
+              WHERE p.end_reason = 'compression' AND COALESCE(c.source, '') != 'tool'
+                AND COALESCE(json_extract(CASE WHEN json_valid(c.model_config) THEN c.model_config ELSE json_object() END, '$._delegate_from'), '') != c.parent_session_id
+                AND COALESCE(json_extract(CASE WHEN json_valid(c.model_config) THEN c.model_config ELSE json_object() END, '$._branched_from'), '') != c.parent_session_id
+                AND COALESCE(json_extract(CASE WHEN json_valid(c.model_config) THEN c.model_config ELSE json_object() END, '$._reset_from'), '') != c.parent_session_id
+            )
+            SELECT role, finish_reason, tool_calls FROM messages
+            WHERE session_id IN (SELECT id FROM lineage)
+            ORDER BY id DESC LIMIT 1
             """)?.first else { return true }
-        return last["role"] == "assistant" && last["finish_reason"] == "stop"
+        if ["error", "agent_error", "content_filter"].contains(last["finish_reason"]?.lowercased() ?? "") { return false }
+        if last["role"] == "user" || last["role"] == "tool" { return false }
+        if last["role"] == "assistant", last["tool_calls"] != nil { return false }
+        return true
     }
 
     /// OpenCode sessions record each turn as messages; an "idle" message ends it with an outcome.
@@ -436,7 +475,7 @@ final class AgentReader: @unchecked Sendable {
             var keyID = threadID
             if app == .hermes {
                 let profile = HermesProfile.named(record.profile)
-                threadID = hermesRoot(threadID, in: profile)
+                threadID = hermesConversation(threadID, in: profile)
                 keyID = profile.key(threadID)
                 title = title ?? sqliteQuery(profile.db, "SELECT title FROM sessions WHERE id = \(sqlQuote(threadID))")?.first?["title"]
             }
@@ -454,15 +493,35 @@ final class AgentReader: @unchecked Sendable {
         sessionID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed).flatMap { URL(string: "hermes://open/sessions/\($0)") }
     }
 
-    /// Hermes keys turns by the conversation's lineage root; walk parents to find it.
-    private func hermesRoot(_ sessionID: String, in profile: HermesProfile) -> String {
-        var current = sessionID
-        for _ in 0..<32 {
-            guard let parent = sqliteQuery(profile.db, "SELECT parent_session_id AS p FROM sessions WHERE id = \(sqlQuote(current))")?
-                .first?["p"], !parent.isEmpty else { break }
-            current = parent
-        }
-        return current
+    /// The chat a Hermes session belongs to. Subchats (subagent runs, compression continuations)
+    /// belong to their parent chat, so a question from one is reported under that chat, not as a
+    /// chat of its own; a branch/reset child is a chat of its own and stays itself. A gateway
+    /// `session_key` resolves to its session first. Unknown ids stay as reported.
+    private func hermesConversation(_ sessionID: String, in profile: HermesProfile) -> String {
+        let id = sqlQuote(sessionID)
+        let config = "CASE WHEN json_valid(s.model_config) THEN s.model_config ELSE json_object() END"
+        guard let top = sqliteQuery(profile.db, """
+            WITH RECURSIVE up(id, parent, branched, reset, started, skey, p_end, p_ended, p_skey, depth) AS (
+              SELECT s.id, s.parent_session_id,
+                json_extract(\(config), '$._branched_from'), json_extract(\(config), '$._reset_from'),
+                s.started_at, s.session_key, p.end_reason, p.ended_at, p.session_key, 0
+              FROM sessions s LEFT JOIN sessions p ON p.id = s.parent_session_id
+              WHERE s.id = (SELECT id FROM sessions WHERE id = \(id) OR session_key = \(id)
+                ORDER BY (id = \(id)) DESC LIMIT 1)
+              UNION ALL
+              SELECT s.id, s.parent_session_id,
+                json_extract(\(config), '$._branched_from'), json_extract(\(config), '$._reset_from'),
+                s.started_at, s.session_key, p.end_reason, p.ended_at, p.session_key, u.depth + 1
+              FROM sessions s JOIN up u ON s.id = u.parent
+              LEFT JOIN sessions p ON p.id = s.parent_session_id
+              WHERE u.depth < 32 AND u.parent IS NOT NULL AND u.branched IS NULL AND u.reset IS NULL
+                AND NOT (u.p_end = 'branched' AND u.started >= u.p_ended)
+                AND NOT (u.p_end IN ('session_reset', 'session_switch', 'idle', 'daily', 'suspended', 'resume_pending_expired')
+                  AND u.skey IS NOT NULL AND u.skey != '' AND u.skey = u.p_skey)
+            )
+            SELECT id FROM up ORDER BY depth DESC LIMIT 1
+            """)?.first?["id"] else { return sessionID }
+        return top
     }
 }
 

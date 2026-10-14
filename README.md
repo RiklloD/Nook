@@ -71,7 +71,7 @@ Requires Xcode (for SwiftUI's macros); no project file.
 | --- | --- | --- | --- |
 | T3 Code | `~/.t3/userdata/statev2.sqlite` runs | same | pending questions / approvals |
 | ChatGPT (Codex) | `~/.codex` rollout `task_started` | `task_complete` | not saved on disk |
-| Hermes | turn leases in `~/.hermes/state.db` and every profile's `~/.hermes/profiles/<name>/state.db` | lease released; failed unless the last message is the final answer | `hermes-plugin/nook` (approvals, `clarify`) |
+| Hermes | turn leases in `~/.hermes/state.db` and every profile's `~/.hermes/profiles/<name>/state.db`, for chats Hermes itself lists (subagent runs stay under their parent chat; branch chats are their own) | lease released; outcome from the chat's own last message, as Hermes classifies it — an error finish or a turn stopped mid-way fails, a plain end is done | `hermes-plugin/nook` (approvals, `clarify`) |
 | Claude Code | hooks (`./install.sh --claude`) run `Nook --claude-hook`, which keeps only the session, event, folder and transcript path | `Stop` / `StopFailure` | approval and question notifications |
 | OpenCode | `~/.local/share/opencode/opencode.db` user message after the last idle | `idle` message outcome | not saved on disk |
 | Anything else | JSON files in `~/Library/Application Support/Nook/inbox/` | | |
