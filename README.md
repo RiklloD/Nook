@@ -1,7 +1,7 @@
 # Nook
 
 An Alcove-style notch for what you actually use: **Spotify, YouTube and other sites (any browser),
-T3 Code, ChatGPT/Codex, Hermes, Claude Code and OpenCode**. Native Swift, no dependencies, event-driven.
+T3 Code, ChatGPT/Codex, Hermes, IronClaw, Claude Code and OpenCode**. Native Swift, no dependencies, event-driven.
 
 ## Flow
 
@@ -13,7 +13,8 @@ T3 Code, ChatGPT/Codex, Hermes, Claude Code and OpenCode**. Native Swift, no dep
 | **Switch tabs** | Two-finger swipe left/right on the open panel: it follows your fingers and snaps to the other tab, like swiping between Spaces. Vertical scrolling still scrolls the agents list. |
 | **Media tab** | Artwork (16:9 for browser video), title, scrubbable progress, controls. Browser video gets ±10 s instead of next/previous. Click artwork to open the player. |
 | **Websites** | Browsers only tell macOS the title and channel, so Nook finds the matching tab: Zen/Firefox from their open tabs (session file) and, for a page opened since that was saved, their history; Safari/Chrome/Arc via AppleScript (macOS asks once). A loose title match only counts when it points at a single page. Nook then shows the site's icon and name and the video's thumbnail (YouTube's own, Twitch's live frame, otherwise the page's `og:image`). |
-| **Agents tab** | Needs-you first, then failed/done (kept 20 min, longer until you've seen them), then working with live duration. Click a row to open it: ChatGPT and Hermes open the exact thread, CLI sessions their terminal tab or editor window, T3 comes to the front (it has no thread links). Hover a finished or waiting row to dismiss it. |
+| **Jump** | **⌃⌥N** from anywhere goes straight to the agent waiting on you (else the newest finish you haven't seen), like clicking it; press again for the next. With nothing waiting it shows/hides the panel. Toggle in Settings. |
+| **Agents tab** | Needs-you first, then failed/done (kept 20 min, longer until you've seen them), then working with what each is doing right now ("Editing files", "Running commands", "Browsing the web") and for how long. Click a row to open it: ChatGPT and Hermes open the exact thread, CLI sessions their terminal tab or editor window, T3 comes to the front (it has no thread links). Hover a finished or waiting row to dismiss it. |
 
 ### Priority (closed notch, peeks and default tab)
 
@@ -73,6 +74,7 @@ Requires Xcode (for SwiftUI's macros); no project file.
 | ChatGPT (Codex) | `~/.codex` rollout `task_started` | `task_complete` | not saved on disk |
 | Hermes | turn leases in `~/.hermes/state.db` and every profile's `~/.hermes/profiles/<name>/state.db`, for chats Hermes itself lists (subagent runs stay under their parent chat; branch chats are their own) | lease released; outcome from the chat's own last message, as Hermes classifies it — an error finish or a turn stopped mid-way fails, a plain end is done | `hermes-plugin/nook` (approvals, `clarify`) |
 | Claude Code | hooks (`./install.sh --claude`) run `Nook --claude-hook`, which keeps only the session, event, folder and transcript path | `Stop` / `StopFailure` | approval and question notifications |
+| IronClaw | `~/.ironclaw/reborn/local-dev/reborn-local-dev.db`: `orch_threads.turn_state = running` | turn ended; outcome from the last `orch_turns` row | `orch_awaiting`, undecided `orch_cli_approvals` |
 | OpenCode | `~/.local/share/opencode/opencode.db` user message after the last idle | `idle` message outcome | not saved on disk |
 | Anything else | JSON files in `~/Library/Application Support/Nook/inbox/` | | |
 
@@ -84,7 +86,12 @@ Clicking a CLI session (Codex, Claude Code, Hermes, OpenCode) goes to where it r
 CLI's process (the hook's parent for Claude Code; otherwise the process running in the session's
 folder), follows its parent processes up to the app, and then selects the Terminal/iTerm tab by tty,
 focuses the VS Code/Cursor/Windsurf window holding that folder, or brings any other app (Ghostty, Yab,
-Claude) to the front. Sessions T3 Code drives are listed once, under T3.
+Claude) to the front.
+
+**One thread, one row.** T3 Code, Hermes and IronClaw run Claude Code and Codex as their model backends. Those
+sessions are listed once, under the app that drives them: Codex threads by T3/IronClaw's own records of them,
+Claude Code sessions by the hook noting (while the process is alive) whether T3, a Hermes gateway/CLI (the python
+under `~/.hermes`) or IronClaw's server (`~/.ironclaw`) started it. A CLI you start yourself in a terminal is yours.
 
 ## Limits
 

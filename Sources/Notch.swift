@@ -88,6 +88,18 @@ final class NotchModel: ObservableObject {
     @Published var tab = Tab.media
     @Published var notch = CGSize(width: 185, height: 32)
     @AppStorage("openOnHover") var openOnHover = true
+    /// The global shortcut (`Hotkey.label`) that jumps to whatever agent needs you.
+    @Published var jumpHotkey = UserDefaults.standard.object(forKey: "jumpHotkey") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(jumpHotkey, forKey: "jumpHotkey")
+            hotkey?.isEnabled = jumpHotkey
+        }
+    }
+    /// A soft sound when an agent starts waiting on you. Off unless you turn it on.
+    @Published var chime = UserDefaults.standard.bool(forKey: "chime") {
+        didSet { UserDefaults.standard.set(chime, forKey: "chime") }
+    }
+    private var hotkey: Hotkey?
 
     let media = MediaController()
     let agents = AgentStore()
@@ -115,8 +127,15 @@ final class NotchModel: ObservableObject {
         observers.append(agents.$alertCount.dropFirst().sink { [weak self] _ in
             guard let self, let thread = self.agents.alert else { return }
             // Only a thread waiting on you pops a card; a finish stays passive in the wings.
-            if case .needsInput = thread.state { self.showPeek(.agent(thread), for: 4.5) } else { self.nudge() }
+            if case .needsInput = thread.state {
+                if self.chime { NSSound(named: "Tink")?.play() }
+                self.showPeek(.agent(thread), for: 4.5)
+            } else {
+                self.nudge()
+            }
         })
+        hotkey = Hotkey { [weak self] in self?.jump() }
+        hotkey?.isEnabled = jumpHotkey
     }
 
     // MARK: What to show
@@ -275,6 +294,22 @@ final class NotchModel: ObservableObject {
         }
         outsideClick = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             Task { @MainActor in self?.close() }
+        }
+    }
+
+    /// The global shortcut: straight to the agent waiting on you, else the newest finish you
+    /// haven't looked at, opening it like a click (which clears it, so pressing again goes to the
+    /// next one). With nothing waiting it shows or hides the panel.
+    func jump() {
+        let threads = agents.threads
+        if let thread = threads.first(where: \.state.isWaiting)
+            ?? threads.first(where: { $0.state.isFinished && !agents.isSeen($0) }) {
+            agents.open(thread)
+            close()
+        } else if phase == .open {
+            close()
+        } else {
+            openFromLaunch()
         }
     }
 

@@ -1,6 +1,6 @@
 import AppKit
 
-// Agent threads from T3 Code, ChatGPT (Codex), Hermes, OpenCode and Claude Code, read straight from
+// Agent threads from T3 Code, ChatGPT (Codex), Hermes, IronClaw, OpenCode and Claude Code, read straight from
 // their local state, read-only. FSEvents/kqueue tell us which source's files changed and only that
 // one is re-read, coalesced to at most once a second while an agent is streaming.
 
@@ -39,6 +39,7 @@ enum AgentApp: String, CaseIterable {
     case t3 = "T3 Code"
     case chatgpt = "ChatGPT"
     case hermes = "Hermes"
+    case ironclaw = "IronClaw"
     case other = "Other"
 
     var bundleID: String {
@@ -46,6 +47,7 @@ enum AgentApp: String, CaseIterable {
         case .t3: "com.t3tools.t3code"
         case .chatgpt: "com.openai.codex"
         case .hermes: "com.nousresearch.hermes"
+        case .ironclaw: "com.ironclaw.desktop"
         case .other: ""
         }
     }
@@ -62,6 +64,30 @@ struct AgentThread: Identifiable, Equatable {
     var host: AgentHost? = nil
     /// When the record behind it stops counting (inbox files that set `expiresAt`).
     var expiresAt: Date? = nil
+    /// What a working agent is doing right now ("Editing files"), when its source says.
+    var activity: String? = nil
+}
+
+/// A short "what it's doing" from a tool or step name, whichever harness it comes from (Claude's
+/// "Bash", Codex's "CommandExecution", T3's "file_change", Hermes' "web_search"…). Order matters:
+/// "web_search" is browsing, not reading. Anything unrecognised is plain "Working" (nil).
+func activityPhrase(_ raw: String?) -> String? {
+    guard let name = raw?.lowercased(), !name.isEmpty else { return nil }
+    func has(_ words: String...) -> Bool { words.contains { name.contains($0) } }
+    if has("askuser", "user_input", "clarify") { return nil }
+    if has("web", "browser", "fetch", "url") { return "Browsing the web" }
+    if has("usermessage", "user_message") { return "Thinking" } // your prompt just went in
+    if has("message") { return "Writing" }
+    if has("subagent", "delegate", "agent") || name == "task" { return "Running subagents" }
+    if has("todo", "plan") { return "Planning" }
+    if has("compact", "compress") { return "Compacting context" }
+    if has("edit", "write", "patch", "file_change", "filechange", "apply", "notebook") { return "Editing files" }
+    if has("bash", "shell", "terminal", "command", "exec", "process") { return "Running commands" }
+    if has("read", "grep", "glob", "search", "view", "find", "list") { return "Reading" }
+    if has("computer", "click", "screenshot", "press_key", "app_state") { return "Using the computer" }
+    if has("reasoning", "thinking") { return "Thinking" }
+    if has("mcp", "tool") { return "Using tools" }
+    return nil
 }
 
 /// The app a Codex thread runs in when it isn't the ChatGPT app: the CLI in a terminal or an
@@ -73,7 +99,7 @@ struct AgentHost: Equatable {
     var folder: String? = nil
 }
 
-enum AgentSource: CaseIterable { case t3, codex, hermes, opencode, inbox }
+enum AgentSource: CaseIterable { case t3, codex, hermes, ironclaw, opencode, inbox }
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let supportDir = "\(home)/Library/Application Support/Nook"
@@ -121,10 +147,11 @@ final class AgentStore: ObservableObject {
         // watched, never -shm, which our own reads touch.
         let databases: [(String, AgentSource)] = [
             (AgentReader.t3DB, .t3), (AgentReader.codexDB, .codex),
-            (AgentReader.opencodeDB, .opencode),
+            (AgentReader.opencodeDB, .opencode), (AgentReader.ironclawDB, .ironclaw),
         ]
+        // T3 and IronClaw also decide which Codex and Claude Code sessions are theirs.
         for (path, source) in databases {
-            watch(path, source == .t3 ? [.t3, .codex] : [source])
+            watch(path, source == .t3 ? [.t3, .codex] : source == .ironclaw ? [.ironclaw, .codex, .inbox] : [source])
         }
         watchHermesProfiles()
         // Inbox files are written and closed, which FSEvents does report.
@@ -137,7 +164,7 @@ final class AgentStore: ObservableObject {
             let id = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
             Task { @MainActor in
                 guard let self, self.threads.contains(where: { $0.host?.bundleID == id }) else { return }
-                self.markDirty([.codex, .hermes, .opencode, .inbox])
+                self.markDirty([.codex, .hermes, .ironclaw, .opencode, .inbox])
             }
         }
     }
@@ -311,7 +338,7 @@ final class AgentStore: ObservableObject {
 
     private func rebuild() {
         var merged: [String: AgentThread] = [:]
-        for source in [AgentSource.t3, .codex, .hermes, .opencode] {
+        for source in [AgentSource.t3, .codex, .hermes, .ironclaw, .opencode] {
             for thread in bySource[source] ?? [] { merged[thread.id] = thread }
         }
         // Inbox entries (Hermes approvals, scripts) win when they are more urgent.
