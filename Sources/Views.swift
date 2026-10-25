@@ -554,7 +554,7 @@ private struct AgentsPanel: View {
         if agents.threads.isEmpty {
             VStack(spacing: 7) {
                 HStack(spacing: 10) {
-                    ForEach([AgentApp.t3, .chatgpt, .hermes], id: \.self) { app in
+                    ForEach(launchable, id: \.self) { app in
                         Button { launch(app.bundleID) } label: { AppIcon(bundleID: app.bundleID, size: 24) }
                             .buttonStyle(PressStyle())
                             .help("Open \(app.rawValue)")
@@ -599,6 +599,11 @@ private struct AgentsPanel: View {
             }
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: agents.threads.map(\.id))
         }
+    }
+
+    /// The agent apps installed here.
+    private var launchable: [AgentApp] {
+        [AgentApp.t3, .chatgpt, .hermes, .ironclaw].filter { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0.bundleID) != nil }
     }
 
     private func launch(_ bundleID: String) {
@@ -660,7 +665,7 @@ struct StateLabel: View {
         case .needsInput(let detail, _): "\(thread.appName) · \(detail.isEmpty ? "Needs your input" : detail)"
         case .failed(let at): "\(thread.appName) · Failed \(ago(at, now))"
         case .done(let at): "\(thread.appName) · Done \(ago(at, now))"
-        case .working(let since): "\(thread.appName) · Working · \(duration(since, now))"
+        case .working(let since): "\(thread.appName) · \(thread.activity ?? "Working") · \(duration(since, now))"
         }
     }
 
@@ -706,6 +711,8 @@ struct SettingsMenu: View {
         Button("Settings…") { model.showSettings?() }
         Divider()
         Toggle("Open on Hover", isOn: $model.openOnHover)
+        Toggle("Jump Shortcut \(Hotkey.label)", isOn: $model.jumpHotkey)
+        Toggle("Sound When an Agent Needs You", isOn: $model.chime)
         Toggle("Launch at Login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
         Divider()
         Button("Quit Nook") { NSApp.terminate(nil) }

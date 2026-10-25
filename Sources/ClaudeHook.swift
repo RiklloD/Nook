@@ -1,18 +1,23 @@
 import Foundation
 
-/// What Nook keeps of a Claude Code hook event: enough to show the session and find where it
-/// runs. Tool input and output, prompts and messages are never stored.
+/// What Nook keeps of a Claude Code hook event: enough to show the session, find where it runs
+/// and say what it's doing (the tool's name, e.g. "Edit"). Tool input and output, prompts and
+/// messages are never stored.
 struct ClaudeHookEvent: Codable {
     let sessionID: String
     let name: String
     var notificationType: String?
     var cwd: String?
     var transcriptPath: String?
+    var toolName: String?
+    /// Nook's own: the app driving this Claude Code (see `drivingApp`), noted while the process is
+    /// alive, since its parents can't be traced once it exits.
+    var driver: String?
 
-    // Claude Code's own field names, so a record is a strict subset of the event.
+    // Claude Code's own field names, so a record is a strict subset of the event (plus `driver`).
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", name = "hook_event_name", notificationType = "notification_type"
-        case cwd, transcriptPath = "transcript_path"
+        case cwd, transcriptPath = "transcript_path", toolName = "tool_name", driver = "nook_driver"
     }
 }
 
@@ -35,8 +40,9 @@ enum ClaudeHook {
             input.append(chunk)
             guard input.count <= maxEventSize else { return }
         }
-        guard let event = try? JSONDecoder().decode(ClaudeHookEvent.self, from: input),
-              let record = try? JSONEncoder().encode(event) else { return }
+        guard var event = try? JSONDecoder().decode(ClaudeHookEvent.self, from: input) else { return }
+        event.driver = drivingApp(of: pid)?.rawValue
+        guard let record = try? JSONEncoder().encode(event) else { return }
         let target = "\(inboxDir)/claude-\(pid).hook"
         let temporary = "\(inboxDir)/.claude-\(pid)-\(UUID().uuidString)"
         guard FileManager.default.createFile(atPath: temporary, contents: record, attributes: [.posixPermissions: 0o600]) else { return }

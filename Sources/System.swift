@@ -5,7 +5,28 @@ import SQLite3
 
 extension AgentHost {
     /// Apps Nook reads directly, which open their own threads better than any window guess.
-    var isNativeApp: Bool { [AgentApp.t3, .chatgpt, .hermes].contains { $0.bundleID == bundleID } }
+    var isNativeApp: Bool { [AgentApp.t3, .chatgpt, .hermes, .ironclaw].contains { $0.bundleID == bundleID } }
+}
+
+/// The agent app driving a CLI process, among the ones Nook reads itself, found by walking up its
+/// parents: T3 Code, IronClaw's server (~/.ironclaw), or Hermes' gateway or CLI (the python under
+/// ~/.hermes). Those run Claude Code and Codex as their model backend, so the same turn would
+/// otherwise be listed twice: once under the app, once as a bare CLI session. The Hermes and
+/// IronClaw desktop apps themselves don't count: a CLI you start in a terminal they host is yours.
+func drivingApp(of pid: pid_t) -> AgentApp? {
+    var current = pid
+    for _ in 0..<32 {
+        guard let info = bsdInfo(current), info.pbi_ppid > 1 else { return nil }
+        current = pid_t(info.pbi_ppid)
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(current, &buffer, UInt32(buffer.count)) > 0 else { continue }
+        let path = String(nulTerminated: buffer)
+        if path.hasPrefix("\(home)/.ironclaw/") { return .ironclaw }
+        if path.hasPrefix("\(home)/.hermes/"), processArguments(current).contains(where: { $0.contains("hermes") }) { return .hermes }
+        if let range = path.range(of: ".app/"),
+           Bundle(path: String(path[..<range.lowerBound]) + ".app")?.bundleIdentifier == AgentApp.t3.bundleID { return .t3 }
+    }
+    return nil
 }
 
 /// Running processes `isAgent` accepts (given pid and executable name), minus helpers spawned by

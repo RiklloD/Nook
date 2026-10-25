@@ -68,6 +68,8 @@ private struct SettingsView: View {
                         .buttonStyle(.link).font(.caption)
                 }
                 Row("Open on hover", detail: "Off: click the notch to open it.", isOn: $model.openOnHover)
+                Row("Jump shortcut \(Hotkey.label)", detail: "Goes straight to the agent that needs you.", isOn: $model.jumpHotkey)
+                Row("Sound when an agent needs you", isOn: $model.chime)
             }
 
             Text("Open Nook again while its panel shows to come back here, or right-click the notch.")
